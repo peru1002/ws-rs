@@ -36,6 +36,7 @@ pub mod deflate;
 
 pub mod util;
 
+use url::Url;
 pub use factory::Factory;
 pub use handler::Handler;
 
@@ -114,6 +115,30 @@ where
     H: Handler,
 {
     let mut ws = WebSocket::new(factory)?;
+    let parsed = url::Url::parse(url.borrow()).map_err(|err| {
+        Error::new(
+            ErrorKind::Internal,
+            format!("Unable to parse {} as url due to {:?}", url.borrow(), err),
+        )
+    })?;
+    ws.connect(parsed)?;
+    ws.run()?;
+    Ok(())
+}
+
+pub fn connect_with_proxy<U, F, H>(url: U, proxy: U,factory: F) -> Result<()>
+where
+    U: Borrow<str>,
+    F: FnMut(Sender) -> H,
+    H: Handler,
+{
+    let parsed_proxy = url::Url::parse(proxy.borrow()).map_err(|err| {
+        Error::new(
+            ErrorKind::Internal,
+            format!("Unable to parse {} as url due to {:?}", url.borrow(), err),
+        )
+    })?;
+    let mut ws = WebSocket::new_with_proxy(factory, parsed_proxy)?;
     let parsed = url::Url::parse(url.borrow()).map_err(|err| {
         Error::new(
             ErrorKind::Internal,
@@ -236,6 +261,8 @@ pub struct Settings {
     ///
     /// Default: false
     pub tcp_nodelay: bool,
+
+    pub proxy: Option<SocketAddr>,
 }
 
 impl Default for Settings {
@@ -266,6 +293,7 @@ impl Default for Settings {
             method_strict: false,
             encrypt_server: false,
             tcp_nodelay: false,
+            proxy: None
         }
     }
 }
@@ -286,6 +314,16 @@ where
     /// Create a new WebSocket using the given Factory to create handlers.
     pub fn new(factory: F) -> Result<WebSocket<F>> {
         Builder::new().build(factory)
+    }
+
+    pub fn new_with_proxy(factory: F, proxy: Url,) -> Result<WebSocket<F>> {
+        let mut settings = Settings::default();
+
+        let mut addrs = proxy.to_socket_addrs()?;
+
+        settings.proxy = addrs.next();
+
+        Builder::new().with_settings(settings).build(factory)
     }
 
     /// Consume the WebSocket and bind to the specified address.

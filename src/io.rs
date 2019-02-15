@@ -1,12 +1,12 @@
 use std::borrow::Borrow;
-use std::io::{Error as IoError, ErrorKind};
+use std::io::{Error as IoError, ErrorKind, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use std::usize;
 
 use mio;
 use mio::tcp::{TcpListener, TcpStream};
-use mio::{Poll, PollOpt, Ready, Token};
+use mio::{Events, Poll, PollOpt, Ready, Token};
 use mio_extras;
 
 use url::Url;
@@ -18,14 +18,14 @@ use super::Settings;
 use communication::{Command, Sender, Signal};
 use connection::Connection;
 use factory::Factory;
-use slab::Slab;
 use result::{Error, Kind, Result};
-
+use slab::Slab;
 
 const QUEUE: Token = Token(usize::MAX - 3);
 const TIMER: Token = Token(usize::MAX - 4);
 pub const ALL: Token = Token(usize::MAX - 5);
 const SYSTEM: Token = Token(usize::MAX - 6);
+const PROXY: Token = Token(usize::MAX -7);
 
 type Conn<F> = Connection<<F as Factory>::Handler>;
 
@@ -56,6 +56,46 @@ fn url_to_addrs(url: &Url) -> Result<Vec<SocketAddr>> {
         .collect::<Vec<SocketAddr>>();
     addrs.dedup();
     Ok(addrs)
+}
+
+fn get_proxy_stream(poll: &mut Poll, proxy: &SocketAddr, url: &Url) -> Result<TcpStream> {
+    if let Ok(mut sock) = TcpStream::connect(proxy) {
+        poll.register(&sock, PROXY, Ready::writable(), PollOpt::oneshot())
+            .unwrap();
+
+        let mut events = Events::with_capacity(1024);
+
+        loop {
+            poll.poll(&mut events, Some(Duration::from_secs(5)))?;
+            for event in events.iter() {
+                if event.readiness().is_writable() {
+                    let host = format!("{}:{}",url.host_str().unwrap(), url.port_or_known_default().unwrap_or(80));
+                    let connect = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n", host, host);
+                    debug!("{}",connect);
+                    sock.write(connect.as_ref())?;
+
+                    poll.reregister(&sock, PROXY, Ready::readable(), PollOpt::oneshot())
+                        .unwrap();
+                }
+
+                if event.readiness().is_readable() {
+                    let mut buf = [0; 1024];
+                    if let Ok(n) = sock.read(&mut buf) {
+                        let s = String::from_utf8(buf[0..n].to_vec()).unwrap();
+                        if s.trim() == "HTTP/1.1 200 Connection established" {
+                            let _ = poll.deregister(&sock);
+                            return Ok(sock);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Err(Error::new(
+        Kind::Internal,
+        format!("Not a valid proxy url: {}", url),
+    ))
 }
 
 enum State {
@@ -169,32 +209,46 @@ where
                         "Unable to add another connection to the event loop.",
                     ));
                 };
+let mut addresses = Vec::new();
 
-            let mut addresses = match url_to_addrs(&url) {
-                Ok(addresses) => addresses,
-                Err(err) => {
-                    self.factory.connection_lost(handler);
-                    return Err(err);
-                }
-            };
-
-            loop {
-                if let Some(addr) = addresses.pop() {
-                    if let Ok(sock) = TcpStream::connect(&addr) {
-                        if settings.tcp_nodelay {
-                            sock.set_nodelay(true)?
-                        }
-                        addresses.push(addr); // Replace the first addr in case ssl fails and we fallback
-                        entry.insert(Connection::new(tok, sock, handler, settings, connection_id));
-                        break;
+            if settings.proxy.is_none() {
+                addresses = match url_to_addrs(&url) {
+                    Ok(addresses) => addresses,
+                    Err(err) => {
+                        self.factory.connection_lost(handler);
+                        return Err(err);
                     }
-                } else {
-                    self.factory.connection_lost(handler);
-                    return Err(Error::new(
-                        Kind::Internal,
-                        format!("Unable to obtain any socket address for {}", url),
-                    ));
+                };
+
+                loop {
+                    if let Some(addr) = addresses.pop() {
+                        if let Ok(sock) = TcpStream::connect(&addr) {
+                            if settings.tcp_nodelay {
+                                sock.set_nodelay(true)?
+                            }
+                            entry.insert(Connection::new(
+                                tok,
+                                sock,
+                                handler,
+                                settings,
+                                connection_id,
+                            ));
+                            break;
+                        }
+                    } else {
+                        self.factory.connection_lost(handler);
+                        return Err(Error::new(
+                            Kind::Internal,
+                            format!("Unable to obtain any socket address for {}", url),
+                        ));
+                    }
                 }
+            } else {
+                let mut sock = get_proxy_stream(poll, &settings.proxy.unwrap(), &url)?;
+                if settings.tcp_nodelay {
+                    sock.set_nodelay(true)?;
+                }
+                entry.insert(Connection::new(tok, sock, handler, settings, connection_id));
             }
 
             (tok, addresses)
@@ -252,16 +306,17 @@ where
             self.connections[tok.into()].token(),
             self.connections[tok.into()].events(),
             PollOpt::edge() | PollOpt::oneshot(),
-        ).map_err(Error::from)
-            .or_else(|err| {
-                error!(
-                    "Encountered error while trying to build WebSocket connection: {}",
-                    err
-                );
-                let handler = self.connections.remove(tok.into()).consume();
-                self.factory.connection_lost(handler);
-                Err(err)
-            })
+        )
+        .map_err(Error::from)
+        .or_else(|err| {
+            error!(
+                "Encountered error while trying to build WebSocket connection: {}",
+                err
+            );
+            let handler = self.connections.remove(tok.into()).consume();
+            self.factory.connection_lost(handler);
+            Err(err)
+        })
     }
 
     #[cfg(not(any(feature = "ssl", feature = "nativetls")))]
@@ -292,30 +347,46 @@ where
                     ));
                 };
 
-            let mut addresses = match url_to_addrs(&url) {
-                Ok(addresses) => addresses,
-                Err(err) => {
-                    self.factory.connection_lost(handler);
-                    return Err(err);
-                }
-            };
+            let mut addresses = Vec::new();
 
-            loop {
-                if let Some(addr) = addresses.pop() {
-                    if let Ok(sock) = TcpStream::connect(&addr) {
-                        if settings.tcp_nodelay {
-                            sock.set_nodelay(true)?
-                        }
-                        entry.insert(Connection::new(tok, sock, handler, settings, connection_id));
-                        break;
+            if settings.proxy.is_none() {
+                addresses = match url_to_addrs(&url) {
+                    Ok(addresses) => addresses,
+                    Err(err) => {
+                        self.factory.connection_lost(handler);
+                        return Err(err);
                     }
-                } else {
-                    self.factory.connection_lost(handler);
-                    return Err(Error::new(
-                        Kind::Internal,
-                        format!("Unable to obtain any socket address for {}", url),
-                    ));
+                };
+
+                loop {
+                    if let Some(addr) = addresses.pop() {
+                        if let Ok(sock) = TcpStream::connect(&addr) {
+                            if settings.tcp_nodelay {
+                                sock.set_nodelay(true)?
+                            }
+                            entry.insert(Connection::new(
+                                tok,
+                                sock,
+                                handler,
+                                settings,
+                                connection_id,
+                            ));
+                            break;
+                        }
+                    } else {
+                        self.factory.connection_lost(handler);
+                        return Err(Error::new(
+                            Kind::Internal,
+                            format!("Unable to obtain any socket address for {}", url),
+                        ));
+                    }
                 }
+            } else {
+                let mut sock = get_proxy_stream(poll, &settings.proxy.unwrap(), &url)?;
+                if settings.tcp_nodelay {
+                    sock.set_nodelay(true)?;
+                }
+                entry.insert(Connection::new(tok, sock, handler, settings, connection_id));
             }
 
             (tok, addresses)
@@ -342,16 +413,17 @@ where
             self.connections[tok.into()].token(),
             self.connections[tok.into()].events(),
             PollOpt::edge() | PollOpt::oneshot(),
-        ).map_err(Error::from)
-            .or_else(|err| {
-                error!(
-                    "Encountered error while trying to build WebSocket connection: {}",
-                    err
-                );
-                let handler = self.connections.remove(tok.into()).consume();
-                self.factory.connection_lost(handler);
-                Err(err)
-            })
+        )
+        .map_err(Error::from)
+        .or_else(|err| {
+            error!(
+                "Encountered error while trying to build WebSocket connection: {}",
+                err
+            );
+            let handler = self.connections.remove(tok.into()).consume();
+            self.factory.connection_lost(handler);
+            Err(err)
+        })
     }
 
     #[cfg(any(feature = "ssl", feature = "nativetls"))]
@@ -396,18 +468,19 @@ where
             conn.token(),
             conn.events(),
             PollOpt::edge() | PollOpt::oneshot(),
-        ).map_err(Error::from)
-            .or_else(|err| {
-                error!(
-                    "Encountered error while trying to build WebSocket connection: {}",
-                    err
-                );
-                conn.error(err);
-                if settings.panic_on_new_connection {
-                    panic!("Encountered error while trying to build WebSocket connection.");
-                }
-                Ok(())
-            })
+        )
+        .map_err(Error::from)
+        .or_else(|err| {
+            error!(
+                "Encountered error while trying to build WebSocket connection: {}",
+                err
+            );
+            conn.error(err);
+            if settings.panic_on_new_connection {
+                panic!("Encountered error while trying to build WebSocket connection.");
+            }
+            Ok(())
+        })
     }
 
     #[cfg(not(any(feature = "ssl", feature = "nativetls")))]
@@ -455,18 +528,19 @@ where
             conn.token(),
             conn.events(),
             PollOpt::edge() | PollOpt::oneshot(),
-        ).map_err(Error::from)
-            .or_else(|err| {
-                error!(
-                    "Encountered error while trying to build WebSocket connection: {}",
-                    err
-                );
-                conn.error(err);
-                if settings.panic_on_new_connection {
-                    panic!("Encountered error while trying to build WebSocket connection.");
-                }
-                Ok(())
-            })
+        )
+        .map_err(Error::from)
+        .or_else(|err| {
+            error!(
+                "Encountered error while trying to build WebSocket connection: {}",
+                err
+            );
+            conn.error(err);
+            if settings.panic_on_new_connection {
+                panic!("Encountered error while trying to build WebSocket connection.");
+            }
+            Ok(())
+        })
     }
 
     pub fn run(&mut self, poll: &mut Poll) -> Result<()> {
@@ -605,7 +679,8 @@ where
             }
             ALL => {
                 if events.is_readable() {
-                    match self.listener
+                    match self
+                        .listener
                         .as_ref()
                         .expect("No listener provided for server websocket connections")
                         .accept()
@@ -626,9 +701,11 @@ where
                     }
                 }
             }
-            TIMER => while let Some(t) = self.timer.poll() {
-                self.handle_timeout(poll, t);
-            },
+            TIMER => {
+                while let Some(t) = self.timer.poll() {
+                    self.handle_timeout(poll, t);
+                }
+            }
             QUEUE => {
                 for _ in 0..MESSAGES_PER_TICK {
                     match self.queue_rx.try_recv() {
@@ -660,16 +737,18 @@ where
                                                     self.connections[token.into()].token(),
                                                     self.connections[token.into()].events(),
                                                     PollOpt::edge() | PollOpt::oneshot(),
-                                                ).or_else(|err| {
-                                                        self.connections[token.into()]
-                                                            .error(Error::from(err));
-                                                        let handler = self.connections
-                                                            .remove(token.into())
-                                                            .consume();
-                                                        self.factory.connection_lost(handler);
-                                                        Ok::<(), Error>(())
-                                                    })
-                                                    .unwrap();
+                                                )
+                                                .or_else(|err| {
+                                                    self.connections[token.into()]
+                                                        .error(Error::from(err));
+                                                    let handler = self
+                                                        .connections
+                                                        .remove(token.into())
+                                                        .consume();
+                                                    self.factory.connection_lost(handler);
+                                                    Ok::<(), Error>(())
+                                                })
+                                                .unwrap();
                                                 return;
                                             }
                                             Err(err) => {
@@ -699,16 +778,18 @@ where
                                                     self.connections[token.into()].token(),
                                                     self.connections[token.into()].events(),
                                                     PollOpt::edge() | PollOpt::oneshot(),
-                                                ).or_else(|err| {
-                                                        self.connections[token.into()]
-                                                            .error(Error::from(err));
-                                                        let handler = self.connections
-                                                            .remove(token.into())
-                                                            .consume();
-                                                        self.factory.connection_lost(handler);
-                                                        Ok::<(), Error>(())
-                                                    })
-                                                    .unwrap();
+                                                )
+                                                .or_else(|err| {
+                                                    self.connections[token.into()]
+                                                        .error(Error::from(err));
+                                                    let handler = self
+                                                        .connections
+                                                        .remove(token.into())
+                                                        .consume();
+                                                    self.factory.connection_lost(handler);
+                                                    Ok::<(), Error>(())
+                                                })
+                                                .unwrap();
                                                 return;
                                             }
                                             Err(err) => {
@@ -980,6 +1061,18 @@ mod test {
             }) => (), // pass
             err => panic!("{:?}", err),
         }
+    }
+
+    #[test]
+    fn test_get_proxy_stream() {
+        let mut poll = Poll::new().unwrap();
+        let mut proxy = Url::from_str("http://localhost:3128")
+            .unwrap()
+            .to_socket_addrs()
+            .unwrap();;
+        let url = Url::from_str("ws://example.com").unwrap();
+
+        assert!(get_proxy_stream(&mut poll, &proxy.next().unwrap(), &url).is_ok());
     }
 
 }
