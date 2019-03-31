@@ -59,38 +59,50 @@ fn url_to_addrs(url: &Url) -> Result<Vec<SocketAddr>> {
 }
 
 fn get_proxy_stream(poll: &mut Poll, proxy: &SocketAddr, url: &Url) -> Result<TcpStream> {
-    if let Ok(mut sock) = TcpStream::connect(proxy) {
-        poll.register(&sock, PROXY, Ready::writable(), PollOpt::oneshot())
-            .unwrap();
-
-        let mut events = Events::with_capacity(1024);
-
-        loop {
-            poll.poll(&mut events, Some(Duration::from_secs(5)))?;
-            for event in events.iter() {
-                if event.readiness().is_writable() {
-                    let host = format!("{}:{}",url.host_str().unwrap(), url.port_or_known_default().unwrap_or(80));
-                    let connect = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n", host, host);
-                    debug!("{}",connect);
-                    sock.write(connect.as_ref())?;
-
-                    poll.reregister(&sock, PROXY, Ready::readable(), PollOpt::oneshot())
-                        .unwrap();
-                }
-
-                if event.readiness().is_readable() {
-                    let mut buf = [0; 1024];
-                    if let Ok(n) = sock.read(&mut buf) {
-                        let s = String::from_utf8(buf[0..n].to_vec()).unwrap();
-                        if s.trim() == "HTTP/1.1 200 Connection established" {
-                            let _ = poll.deregister(&sock);
-                            return Ok(sock);
-                        }
-                    }
-                }
-            }
+    let mut raw_stream = std::net::TcpStream::connect(proxy)?;
+    let host = format!("{}:{}",url.host_str().unwrap(), url.port_or_known_default().unwrap_or(80));
+    let connect = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n", host, host);
+    debug!("{}",connect);
+    raw_stream.write(connect.as_ref())?;
+    let mut buf = [0; 1024];
+    if let Ok(n) = raw_stream.read(&mut buf) {
+        let s = String::from_utf8(buf[0..n].to_vec()).unwrap();
+        if s.trim() == "HTTP/1.1 200 Connection established" {
+            return Ok(TcpStream::from_stream(raw_stream)?);
         }
     }
+    // if let Ok(mut sock) = TcpStream::connect(proxy) {
+    //     poll.register(&sock, PROXY, Ready::writable(), PollOpt::oneshot())
+    //         .unwrap();
+
+    //     let mut events = Events::with_capacity(1024);
+
+    //     loop {
+    //         poll.poll(&mut events, Some(Duration::from_secs(5)))?;
+    //         for event in events.iter() {
+    //             if event.readiness().is_writable() {
+    //                 let host = format!("{}:{}",url.host_str().unwrap(), url.port_or_known_default().unwrap_or(80));
+    //                 let connect = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n", host, host);
+    //                 debug!("{}",connect);
+    //                 sock.write(connect.as_ref())?;
+
+    //                 poll.reregister(&sock, PROXY, Ready::readable(), PollOpt::oneshot())
+    //                     .unwrap();
+    //             }
+
+    //             if event.readiness().is_readable() {
+    //                 let mut buf = [0; 1024];
+    //                 if let Ok(n) = sock.read(&mut buf) {
+    //                     let s = String::from_utf8(buf[0..n].to_vec()).unwrap();
+    //                     if s.trim() == "HTTP/1.1 200 Connection established" {
+    //                         let _ = poll.deregister(&sock);
+    //                         return Ok(sock);
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+    //}
 
     Err(Error::new(
         Kind::Internal,
