@@ -25,7 +25,6 @@ const QUEUE: Token = Token(usize::MAX - 3);
 const TIMER: Token = Token(usize::MAX - 4);
 pub const ALL: Token = Token(usize::MAX - 5);
 const SYSTEM: Token = Token(usize::MAX - 6);
-const PROXY: Token = Token(usize::MAX -7);
 
 type Conn<F> = Connection<<F as Factory>::Handler>;
 
@@ -58,7 +57,7 @@ fn url_to_addrs(url: &Url) -> Result<Vec<SocketAddr>> {
     Ok(addrs)
 }
 
-fn get_proxy_stream(poll: &mut Poll, proxy: &SocketAddr, url: &Url) -> Result<TcpStream> {
+fn get_proxy_stream(proxy: &SocketAddr, url: &Url) -> Result<TcpStream> {
     let mut raw_stream = std::net::TcpStream::connect(proxy)?;
     let host = format!("{}:{}",url.host_str().unwrap(), url.port_or_known_default().unwrap_or(80));
     let connect = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n", host, host);
@@ -70,7 +69,7 @@ fn get_proxy_stream(poll: &mut Poll, proxy: &SocketAddr, url: &Url) -> Result<Tc
 
     if let Ok(n) = raw_stream.read(&mut buf) {
         let s = String::from_utf8(buf[0..n].to_vec()).unwrap();
-        if s.trim() == "HTTP/1.1 200 Connection established" {
+        if s.trim().starts_with("HTTP/1.1 200 Connection established") {
             return Ok(TcpStream::from_stream(raw_stream)?);
         }
     }
@@ -365,7 +364,7 @@ let mut addresses = Vec::new();
                     }
                 }
             } else {
-                let mut sock = get_proxy_stream(poll, &settings.proxy.unwrap(), &url)?;
+                let mut sock = get_proxy_stream(&settings.proxy.unwrap(), &url)?;
                 if settings.tcp_nodelay {
                     sock.set_nodelay(true)?;
                 }
