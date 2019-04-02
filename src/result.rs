@@ -62,6 +62,8 @@ pub enum Kind {
     /// because it will allocate the memory on the heap. The WebSocket ignores such errors by
     /// default, simply passing them to the Connection Handler.
     Custom(Box<dyn StdError + Send + Sync>),
+    /// Indicates a failure proxy connect.
+    Proxy
 }
 
 /// A struct indicating the kind of error that has occurred and any precise details of that error.
@@ -124,6 +126,7 @@ impl StdError for Error {
             Kind::SslHandshake(ref err) => err.description(),
             Kind::Queue(_) => "Unable to send signal on event loop",
             Kind::Custom(ref err) => err.description(),
+            Kind::Proxy => "Proxy connect Error",            
         }
     }
 

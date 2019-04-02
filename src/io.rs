@@ -6,7 +6,7 @@ use std::usize;
 
 use mio;
 use mio::tcp::{TcpListener, TcpStream};
-use mio::{Events, Poll, PollOpt, Ready, Token};
+use mio::{Poll, PollOpt, Ready, Token};
 use mio_extras;
 
 use url::Url;
@@ -18,6 +18,7 @@ use super::Settings;
 use communication::{Command, Sender, Signal};
 use connection::Connection;
 use factory::Factory;
+use proxy::Proxy;
 use result::{Error, Kind, Result};
 use slab::Slab;
 
@@ -57,29 +58,6 @@ fn url_to_addrs(url: &Url) -> Result<Vec<SocketAddr>> {
     Ok(addrs)
 }
 
-fn get_proxy_stream(proxy: &SocketAddr, url: &Url) -> Result<TcpStream> {
-    let mut raw_stream = std::net::TcpStream::connect(proxy)?;
-    let host = format!("{}:{}",url.host_str().unwrap(), url.port_or_known_default().unwrap_or(80));
-    let connect = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n", host, host);
-    
-    debug!("{}",connect);
-    raw_stream.write(connect.as_ref())?;
-    
-    let mut buf = [0; 1024];
-
-    if let Ok(n) = raw_stream.read(&mut buf) {
-        let s = String::from_utf8(buf[0..n].to_vec()).unwrap();
-        if s.trim().starts_with("HTTP/1.1 200 Connection established") {
-            return Ok(TcpStream::from_stream(raw_stream)?);
-        }
-    }
-
-    Err(Error::new(
-        Kind::Internal,
-        format!("Not a valid proxy url: {}", url),
-    ))
-}
-
 enum State {
     Active,
     Inactive,
@@ -113,6 +91,7 @@ where
     queue_rx: mio::channel::Receiver<Command>,
     timer: mio_extras::timer::Timer<Timeout>,
     next_connection_id: u32,
+    proxy: Option<Proxy>,
 }
 
 impl<F> Handler<F>
@@ -136,6 +115,28 @@ where
             queue_rx: rx,
             timer,
             next_connection_id: 0,
+            proxy: None,
+        }
+    }
+
+    pub fn new_with_proxy(factory: F, settings: Settings, proxy: Proxy) -> Handler<F> {
+        let (tx, rx) = mio::channel::sync_channel(settings.max_connections * settings.queue_size);
+        let timer = mio_extras::timer::Builder::default()
+            .tick_duration(Duration::from_millis(TIMER_TICK_MILLIS))
+            .num_slots(TIMER_WHEEL_SIZE)
+            .capacity(TIMER_CAPACITY)
+            .build();
+        Handler {
+            listener: None,
+            connections: Slab::with_capacity(settings.max_connections),
+            factory,
+            settings,
+            state: State::Inactive,
+            queue_tx: tx,
+            queue_rx: rx,
+            timer,
+            next_connection_id: 0,
+            proxy: Some(proxy),
         }
     }
 
@@ -191,9 +192,9 @@ where
                         "Unable to add another connection to the event loop.",
                     ));
                 };
-let mut addresses = Vec::new();
+            let mut addresses = Vec::new();
 
-            if settings.proxy.is_none() {
+            if self.proxy.is_none() {
                 addresses = match url_to_addrs(&url) {
                     Ok(addresses) => addresses,
                     Err(err) => {
@@ -226,7 +227,7 @@ let mut addresses = Vec::new();
                     }
                 }
             } else {
-                let mut sock = get_proxy_stream(poll, &settings.proxy.unwrap(), &url)?;
+                let mut sock = self.proxy.as_ref().unwrap().connect(&url)?;
                 if settings.tcp_nodelay {
                     sock.set_nodelay(true)?;
                 }
@@ -331,7 +332,7 @@ let mut addresses = Vec::new();
 
             let mut addresses = Vec::new();
 
-            if settings.proxy.is_none() {
+            if self.proxy.is_none() {
                 addresses = match url_to_addrs(&url) {
                     Ok(addresses) => addresses,
                     Err(err) => {
@@ -364,7 +365,8 @@ let mut addresses = Vec::new();
                     }
                 }
             } else {
-                let mut sock = get_proxy_stream(&settings.proxy.unwrap(), &url)?;
+                let proxy = self.proxy.as_ref().unwrap();
+                let mut sock = proxy.connect(&url)?;
                 if settings.tcp_nodelay {
                     sock.set_nodelay(true)?;
                 }
@@ -1047,14 +1049,10 @@ mod test {
 
     #[test]
     fn test_get_proxy_stream() {
-        let mut poll = Poll::new().unwrap();
-        let mut proxy = Url::from_str("http://localhost:3128")
-            .unwrap()
-            .to_socket_addrs()
-            .unwrap();;
+        let mut proxy = Proxy::new(Url::from_str("http://localhost:3128").unwrap());
         let url = Url::from_str("ws://example.com").unwrap();
 
-        assert!(get_proxy_stream(&mut poll, &proxy.next().unwrap(), &url).is_ok());
+        assert!(proxy.connect(&url).is_ok());
     }
 
 }

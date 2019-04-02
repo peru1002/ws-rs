@@ -30,12 +30,14 @@ mod message;
 mod protocol;
 mod result;
 mod stream;
+mod proxy;
 
 #[cfg(feature = "permessage-deflate")]
 pub mod deflate;
 
 pub mod util;
 
+use proxy::Proxy;
 use url::Url;
 pub use factory::Factory;
 pub use handler::Handler;
@@ -135,7 +137,7 @@ where
     let parsed_proxy = url::Url::parse(proxy.borrow()).map_err(|err| {
         Error::new(
             ErrorKind::Internal,
-            format!("Unable to parse {} as url due to {:?}", url.borrow(), err),
+            format!("Unable to parse {} as url due to {:?}", proxy.borrow(), err),
         )
     })?;
     let mut ws = WebSocket::new_with_proxy(factory, parsed_proxy)?;
@@ -261,8 +263,6 @@ pub struct Settings {
     ///
     /// Default: false
     pub tcp_nodelay: bool,
-
-    pub proxy: Option<SocketAddr>,
 }
 
 impl Default for Settings {
@@ -293,7 +293,6 @@ impl Default for Settings {
             method_strict: false,
             encrypt_server: false,
             tcp_nodelay: false,
-            proxy: None
         }
     }
 }
@@ -317,13 +316,9 @@ where
     }
 
     pub fn new_with_proxy(factory: F, proxy: Url,) -> Result<WebSocket<F>> {
-        let mut settings = Settings::default();
+        let proxy = Proxy::new(proxy);
 
-        let mut addrs = proxy.to_socket_addrs()?;
-
-        settings.proxy = addrs.next();
-
-        Builder::new().with_settings(settings).build(factory)
+        Builder::new().build_with_proxy(factory, proxy)
     }
 
     /// Consume the WebSocket and bind to the specified address.
@@ -418,6 +413,16 @@ impl Builder {
         Ok(WebSocket {
             poll: Poll::new()?,
             handler: io::Handler::new(factory, self.settings),
+        })
+    }
+
+    pub fn build_with_proxy<F>(&self, factory: F, proxy: Proxy) -> Result<WebSocket<F>>
+    where
+        F: Factory,
+    {
+        Ok(WebSocket {
+            poll: Poll::new()?,
+            handler: io::Handler::new_with_proxy(factory, self.settings, proxy),
         })
     }
 
