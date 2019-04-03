@@ -29,7 +29,7 @@ pub fn hash_key(key: &[u8]) -> String {
 }
 
 // This code is based on rustc_serialize base64 STANDARD
-fn encode_base64(data: &[u8]) -> String {
+pub(crate) fn encode_base64(data: &[u8]) -> String {
     let len = data.len();
     let mod_len = len % 3;
 
