@@ -1,5 +1,5 @@
 use std::borrow::Borrow;
-use std::io::{Error as IoError, ErrorKind, Read, Write};
+use std::io::{Error as IoError, ErrorKind};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 use std::usize;

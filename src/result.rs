@@ -1,3 +1,4 @@
+use proxy::AuthType;
 use std::borrow::Cow;
 use std::convert::{From, Into};
 use std::error::Error as StdError;
@@ -63,7 +64,7 @@ pub enum Kind {
     /// default, simply passing them to the Connection Handler.
     Custom(Box<dyn StdError + Send + Sync>),
     /// Indicates a failure proxy connect.
-    Proxy
+    Proxy(Option<Vec<AuthType>>)
 }
 
 /// A struct indicating the kind of error that has occurred and any precise details of that error.
@@ -126,7 +127,7 @@ impl StdError for Error {
             Kind::SslHandshake(ref err) => err.description(),
             Kind::Queue(_) => "Unable to send signal on event loop",
             Kind::Custom(ref err) => err.description(),
-            Kind::Proxy => "Proxy connect Error",            
+            Kind::Proxy(_) => "Proxy connect Error",            
         }
     }
 
