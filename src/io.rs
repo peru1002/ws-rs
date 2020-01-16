@@ -366,7 +366,7 @@ where
                 }
             } else {
                 let proxy = self.proxy.as_ref().unwrap();
-                let mut sock = proxy.connect(&url)?;
+                let sock = proxy.connect(&url)?;
                 if settings.tcp_nodelay {
                     sock.set_nodelay(true)?;
                 }

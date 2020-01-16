@@ -79,7 +79,16 @@ impl Proxy {
     }
 
     pub fn connect(&self, url: &Url) -> Result<TcpStream> {
-        let mut stream = StdTcpStream::connect(&self.url)?;
+        let addrs = if let Ok(addrs) = self.url.socket_addrs(|| None) {
+            addrs
+        } else {
+            return Err(Error::new(
+                Kind::Internal,
+                format!("Not a valid proxy url: {}", url),
+            ));
+        };
+
+        let mut stream = StdTcpStream::connect(&addrs[0])?;
 
         let host = format!(
             "{}:{}",
